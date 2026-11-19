@@ -24,13 +24,15 @@ const MODELS = (process.env.MODELS ||
   .split(',').map(s => s.trim()).filter(Boolean);
 // Модели для фото: нужен vision. nemotron-3-ultra картинки НЕ принимает (404 от OpenRouter).
 const VISION_MODELS = (process.env.VISION_MODELS ||
-  'nvidia/nemotron-3.5-super-vl:free,google/gemma-4-31b-it:free')
+  'google/gemma-4-31b-it:free,nvidia/nemotron-3.5-super-vl:free')
   .split(',').map(s => s.trim()).filter(Boolean);
 const TEXT_MAX_TOKENS = 2000;
 const VISION_MAX_TOKENS = 4096; // reasoning-модель тратит часть лимита на «мысли»
 const DEFAULT_PHOTO_PROMPT = 'Опиши, что на картинке.';
 const PHOTO_INSTRUCTION =
-  'Отвечай кратко и по делу. Если на картинке текст, просто напиши его. Не пиши свои рассуждения шаг за шагом.';
+  'Отвечай кратко и по делу. Не пиши свои рассуждения шаг за шагом. ' +
+  'Если на картинке есть текст — распознай его и просто напиши. ' +
+  'Если текст нечитаемый, стилизованный или ты не уверен — напиши "Не могу разобрать текст". Не выдумывай буквы.';
 const FAIL_MESSAGE_PHOTO =
   'Не удалось распознать изображение: ни одна из моделей не смогла дать ответ. Попробуйте отправить фото с более четким запросом или повторите позже.';
 const FAIL_MESSAGE_EMPTY_TEXT =
