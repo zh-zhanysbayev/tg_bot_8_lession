@@ -31,13 +31,26 @@ const VISION_MAX_TOKENS = 4096; // reasoning-модель тратит част�
 const DEFAULT_PHOTO_PROMPT = 'Опиши, что на картинке.';
 const PHOTO_INSTRUCTION =
   'Отвечай кратко и по делу. Если на картинке текст, просто напиши его. Не пиши свои рассуждения шаг за шагом.';
-const OVERTHOUGHT_MESSAGE_PHOTO =
-  'Модель задумалась слишком сильно и не смогла дать ответ. Попробуйте отправить фото с более четким запросом или используйте текстовую модель.';
-const OVERTHOUGHT_MESSAGE_TEXT =
-  'Модель задумалась слишком сильно и не смогла дать ответ. Попробуйте переформулировать вопрос или задать его короче.';
+const FAIL_MESSAGE_PHOTO =
+  'Не удалось распознать изображение: ни одна из моделей не смогла дать ответ. Попробуйте отправить фото с более четким запросом или повторите позже.';
+const FAIL_MESSAGE_EMPTY_TEXT =
+  'Модели задумались слишком сильно и не смогли дать ответ. Попробуйте переформулировать вопрос или задать его короче.';
+const FAIL_MESSAGE_GENERIC = 'Не удалось получить ответ, попробуй ещё раз чуть позже.';
+const REQUEST_TIMEOUT_MS = 120_000;
 
-// Модель потратила весь лимит токенов на reasoning и не выдала финальный ответ.
-class OverthoughtError extends Error {}
+// Отказ одной модели. kind: 'empty' — 200 OK, но нет финального текста (content пуст,
+// часто весь лимит ушёл в reasoning); 'error' — HTTP-ошибка, таймаут, сеть.
+class ModelFailure extends Error {
+  constructor(kind, message) { super(message); this.kind = kind; }
+}
+// Все модели цепочки отказали.
+class AllModelsFailedError extends Error {
+  constructor(failures) {
+    super(`Все модели отказали: ${failures.map(f => `${f.model} [${f.kind}]`).join(', ')}`);
+    this.failures = failures;
+    this.allEmpty = failures.length > 0 && failures.every(f => f.kind === 'empty');
+  }
+}
 const MAX_PHOTO_BYTES = 5 * 1024 * 1024;
 const SYSTEM_PROMPT = process.env.SYSTEM_PROMPT ||
   'Ты дружелюбный помощник в Telegram. Отвечай кратко и по делу, на языке собеседника.';
@@ -76,45 +89,69 @@ async function photoToDataUrl(photoSizes) {
   return `data:image/jpeg;base64,${buf.toString('base64')}`; // Telegram отдаёт фото как JPEG
 }
 
-async function askModel(messages, models = MODELS, maxTokens = TEXT_MAX_TOKENS) {
-  const res = await fetch('https://openrouter.ai/api/v1/chat/completions', {
-    method: 'POST',
-    headers: {
-      Authorization: `Bearer ${OR_KEY}`,
-      'Content-Type': 'application/json',
-      'X-Title': 'Telegram Nemotron Bot',
-    },
-    body: JSON.stringify({
-      model: models[0],
-      models, // автоматический фолбэк при 429/недоступности
-      messages: [{ role: 'system', content: SYSTEM_PROMPT }, ...messages],
-      max_tokens: maxTokens,
-    }),
-  });
+// Запрос к ОДНОЙ модели. Бросает ModelFailure при ошибке или пустом ответе.
+async function askOneModel(messages, model, maxTokens) {
+  let res;
+  try {
+    res = await fetch('https://openrouter.ai/api/v1/chat/completions', {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${OR_KEY}`,
+        'Content-Type': 'application/json',
+        'X-Title': 'Telegram Nemotron Bot',
+      },
+      // Перебор моделей делаем сами (см. askModel): серверный фолбэк `models`
+      // срабатывает только на ошибках API, но не на 200 OK с пустым content.
+      body: JSON.stringify({
+        model,
+        messages: [{ role: 'system', content: SYSTEM_PROMPT }, ...messages],
+        max_tokens: maxTokens,
+      }),
+      signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
+    });
+  } catch (err) {
+    throw new ModelFailure('error', `сеть/таймаут: ${err.name}: ${err.message}`);
+  }
   const raw = await res.text(); // читаем как текст, чтобы не потерять тело ошибки не-JSON
   let data;
   try { data = JSON.parse(raw); } catch { data = null; }
 
   if (!res.ok) {
-    console.error(`[OpenRouter] HTTP ${res.status} ${res.statusText}`);
+    console.error(`[OpenRouter] ${model}: HTTP ${res.status} ${res.statusText}`);
     console.error('[OpenRouter] Тело ответа целиком:', raw);
-    throw new Error(data?.error?.message || `OpenRouter HTTP ${res.status}`);
+    throw new ModelFailure('error', data?.error?.message || `HTTP ${res.status}`);
   }
-  console.log(`[OpenRouter] OK, модель: ${data?.model}, finish_reason: ${data?.choices?.[0]?.finish_reason}`);
-  const message = data?.choices?.[0]?.message;
-  const text = message?.content?.trim();
+  const choice = data?.choices?.[0];
+  console.log(`[OpenRouter] ${model}: 200 OK, ответила: ${data?.model}, finish_reason: ${choice?.finish_reason}`);
+  const text = choice?.message?.content?.trim();
   if (!text) {
-    const reasoning = message?.reasoning;
-    if (reasoning) {
-      // «Аварийный выход»: content пуст, но есть reasoning — лимит токенов съели рассуждения.
-      console.error(`[OpenRouter] content=null, но есть reasoning (${String(reasoning).length} симв.), ` +
-        `finish_reason: ${data?.choices?.[0]?.finish_reason}, usage: ${JSON.stringify(data?.usage)}`);
-      throw new OverthoughtError('Только reasoning, без финального ответа');
-    }
-    console.error('[OpenRouter] Пустой content. Ответ целиком:', raw);
-    throw new Error('Модель вернула пустой ответ');
+    const reasoning = choice?.message?.reasoning;
+    console.error(`[OpenRouter] ${model}: пустой content` +
+      (reasoning ? ` (но есть reasoning, ${String(reasoning).length} симв.)` : '') +
+      `, finish_reason: ${choice?.finish_reason}, usage: ${JSON.stringify(data?.usage)}`);
+    if (!reasoning) console.error('[OpenRouter] Ответ целиком:', raw);
+    throw new ModelFailure('empty', 'пустой content');
   }
-  return text;
+  return { text, model: data?.model ?? model };
+}
+
+// Перебирает модели по порядку: следующая пробуется и при ошибке API, и при пустом ответе.
+async function askModel(messages, models = MODELS, maxTokens = TEXT_MAX_TOKENS) {
+  const failures = [];
+  for (const [i, model] of models.entries()) {
+    try {
+      const { text, model: usedModel } = await askOneModel(messages, model, maxTokens);
+      console.log(`[OpenRouter] ✔ Финальный ответ дала модель: ${usedModel} (попытка ${i + 1} из ${models.length})`);
+      return text;
+    } catch (err) {
+      if (!(err instanceof ModelFailure)) throw err;
+      failures.push({ model, kind: err.kind, reason: err.message });
+      const next = models[i + 1];
+      console.warn(`[OpenRouter] ✘ ${model}: ${err.kind} — ${err.message}.` +
+        (next ? ` Пробую следующую: ${next}` : ' Моделей больше нет.'));
+    }
+  }
+  throw new AllModelsFailedError(failures);
 }
 
 function splitMessage(text) {
@@ -181,9 +218,9 @@ async function handleMessage(msg) {
   } catch (err) {
     history.pop(); // не сохраняем неудачный запрос
     console.error('Ошибка:', err.message);
-    const reply = err instanceof OverthoughtError
-      ? (isPhoto ? OVERTHOUGHT_MESSAGE_PHOTO : OVERTHOUGHT_MESSAGE_TEXT)
-      : 'Не удалось получить ответ, попробуй ещё раз чуть позже.';
+    let reply = FAIL_MESSAGE_GENERIC;
+    if (isPhoto && err instanceof AllModelsFailedError) reply = FAIL_MESSAGE_PHOTO;
+    else if (err instanceof AllModelsFailedError && err.allEmpty) reply = FAIL_MESSAGE_EMPTY_TEXT;
     await tg('sendMessage', { chat_id: chatId, text: reply }).catch(() => {});
   } finally {
     clearInterval(typing);
