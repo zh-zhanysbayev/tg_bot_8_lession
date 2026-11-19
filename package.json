@@ -1,0 +1,10 @@
+{
+  "name": "telegram-nemotron-bot",
+  "version": "1.0.0",
+  "private": true,
+  "main": "bot.js",
+  "engines": { "node": ">=20.6" },
+  "scripts": {
+    "start": "node bot.js"
+  }
+}
