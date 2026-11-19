@@ -27,8 +27,17 @@ const VISION_MODELS = (process.env.VISION_MODELS ||
   'nvidia/nemotron-3.5-super-vl:free,google/gemma-4-31b-it:free')
   .split(',').map(s => s.trim()).filter(Boolean);
 const TEXT_MAX_TOKENS = 2000;
-const VISION_MAX_TOKENS = 3000; // reasoning-модель тратит часть лимита на «мысли»
+const VISION_MAX_TOKENS = 4096; // reasoning-модель тратит часть лимита на «мысли»
 const DEFAULT_PHOTO_PROMPT = 'Опиши, что на картинке.';
+const PHOTO_INSTRUCTION =
+  'Отвечай кратко и по делу. Если на картинке текст, просто напиши его. Не пиши свои рассуждения шаг за шагом.';
+const OVERTHOUGHT_MESSAGE_PHOTO =
+  'Модель задумалась слишком сильно и не смогла дать ответ. Попробуйте отправить фото с более четким запросом или используйте текстовую модель.';
+const OVERTHOUGHT_MESSAGE_TEXT =
+  'Модель задумалась слишком сильно и не смогла дать ответ. Попробуйте переформулировать вопрос или задать его короче.';
+
+// Модель потратила весь лимит токенов на reasoning и не выдала финальный ответ.
+class OverthoughtError extends Error {}
 const MAX_PHOTO_BYTES = 5 * 1024 * 1024;
 const SYSTEM_PROMPT = process.env.SYSTEM_PROMPT ||
   'Ты дружелюбный помощник в Telegram. Отвечай кратко и по делу, на языке собеседника.';
@@ -92,8 +101,16 @@ async function askModel(messages, models = MODELS, maxTokens = TEXT_MAX_TOKENS) 
     throw new Error(data?.error?.message || `OpenRouter HTTP ${res.status}`);
   }
   console.log(`[OpenRouter] OK, модель: ${data?.model}, finish_reason: ${data?.choices?.[0]?.finish_reason}`);
-  const text = data?.choices?.[0]?.message?.content?.trim();
+  const message = data?.choices?.[0]?.message;
+  const text = message?.content?.trim();
   if (!text) {
+    const reasoning = message?.reasoning;
+    if (reasoning) {
+      // «Аварийный выход»: content пуст, но есть reasoning — лимит токенов съели рассуждения.
+      console.error(`[OpenRouter] content=null, но есть reasoning (${String(reasoning).length} симв.), ` +
+        `finish_reason: ${data?.choices?.[0]?.finish_reason}, usage: ${JSON.stringify(data?.usage)}`);
+      throw new OverthoughtError('Только reasoning, без финального ответа');
+    }
     console.error('[OpenRouter] Пустой content. Ответ целиком:', raw);
     throw new Error('Модель вернула пустой ответ');
   }
@@ -148,7 +165,7 @@ async function handleMessage(msg) {
       const messages = [
         ...history.slice(0, -1),
         { role: 'user', content: [
-          { type: 'text', text: prompt },
+          { type: 'text', text: `${prompt}\n\n${PHOTO_INSTRUCTION}` },
           { type: 'image_url', image_url: { url: imageUrl } },
         ] },
       ];
@@ -164,7 +181,10 @@ async function handleMessage(msg) {
   } catch (err) {
     history.pop(); // не сохраняем неудачный запрос
     console.error('Ошибка:', err.message);
-    await tg('sendMessage', { chat_id: chatId, text: 'Не удалось получить ответ, попробуй ещё раз чуть позже.' }).catch(() => {});
+    const reply = err instanceof OverthoughtError
+      ? (isPhoto ? OVERTHOUGHT_MESSAGE_PHOTO : OVERTHOUGHT_MESSAGE_TEXT)
+      : 'Не удалось получить ответ, попробуй ещё раз чуть позже.';
+    await tg('sendMessage', { chat_id: chatId, text: reply }).catch(() => {});
   } finally {
     clearInterval(typing);
   }
